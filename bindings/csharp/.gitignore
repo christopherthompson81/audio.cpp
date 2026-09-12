@@ -1,0 +1,5 @@
+# .NET build output. The repo's top-level .gitignore only covers CMake's
+# /build*/ directories, so these need their own rule.
+bin/
+obj/
+*.user

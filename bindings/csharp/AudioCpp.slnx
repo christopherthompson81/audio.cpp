@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="AudioCpp.ModelTest/AudioCpp.ModelTest.csproj" />
+  <Project Path="AudioCpp.PathTest/AudioCpp.PathTest.csproj" />
+  <Project Path="AudioCpp/AudioCpp.csproj" />
+</Solution>
