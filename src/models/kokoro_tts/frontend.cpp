@@ -231,15 +231,27 @@ KokoroFrontendSessionState resolve_kokoro_frontend_session_state(
 KokoroSynthesisInput build_kokoro_synthesis_input(
     const runtime::Transcript & text,
     const KokoroFrontendSessionState & state,
-    const KokoroAssets & assets) {
+    const KokoroAssets & assets,
+    const std::string & phoneme_override) {
     if (state.voice_pack == nullptr) {
         throw std::runtime_error("Kokoro frontend session voice pack was not prepared");
     }
-    const std::string phonemes = phonemize_text(text, state.language_code, assets);
+    const bool supplied = !phoneme_override.empty();
+    const std::string phonemes =
+        supplied ? phoneme_override : phonemize_text(text, state.language_code, assets);
     const EncodedInputIds encoded = encode_input_ids_and_count(phonemes, assets);
     if (encoded.phoneme_count > 510) {
+        // Two different failures wearing one message helps nobody: the caller who supplied the
+        // phonemes can fix this by sending less, and is told so; the caller who supplied text
+        // is hitting an engine limitation and is told that instead.
         throw std::runtime_error(
-            "Kokoro phoneme string exceeds 510 symbols; segmenting is not implemented in the framework path yet");
+            supplied
+                ? "Kokoro phoneme chunk exceeds 510 symbols; split the supplied phonemes across "
+                  "more list entries (each entry is rendered separately and the audio is merged)"
+                : "Kokoro phoneme string exceeds 510 symbols; segmenting is not implemented in the framework path yet");
+    }
+    if (supplied) {
+        engine::debug::trace_log_scalar("kokoro.supplied_phoneme_count", static_cast<int64_t>(encoded.phoneme_count));
     }
     KokoroSynthesisInput input;
     input.voice_id = state.voice_id;
@@ -257,11 +269,12 @@ KokoroSynthesisInput build_kokoro_synthesis_input(
 int64_t estimate_kokoro_request_tokens(
     const runtime::SessionPreparationRequest & request,
     const KokoroFrontendSessionState & state,
-    const KokoroAssets & assets) {
+    const KokoroAssets & assets,
+    const std::string & phoneme_override) {
     if (!request.text.has_value()) {
         return 0;
     }
-    const auto input = build_kokoro_synthesis_input(*request.text, state, assets);
+    const auto input = build_kokoro_synthesis_input(*request.text, state, assets, phoneme_override);
     return static_cast<int64_t>(input.input_ids.size());
 }
 

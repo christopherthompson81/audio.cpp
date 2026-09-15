@@ -51,7 +51,7 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 #define AUDIOCPP_ABI_VERSION_MAJOR 0
-#define AUDIOCPP_ABI_VERSION_MINOR 1
+#define AUDIOCPP_ABI_VERSION_MINOR 2
 #define AUDIOCPP_ABI_VERSION_PATCH 0
 
 /* Packed as (major << 16) | (minor << 8) | patch. A caller built against a
@@ -369,6 +369,21 @@ AUDIOCPP_API audiocpp_status audiocpp_request_set_artifact_meta(audiocpp_request
 AUDIOCPP_API audiocpp_status audiocpp_request_set_option(audiocpp_request * request,
                                                          const char * key,
                                                          const char * value);
+
+/* Sets a list-valued request option -- the transport for the `*_list` option
+ * types the model spec already declares. `values` is `count` UTF-8 strings,
+ * copied into the request, so neither the array nor the strings need outlive
+ * the call. A second call with the same key REPLACES the list rather than
+ * appending, matching set_option's assignment semantics.
+ *
+ * List options live in their own map, so a key set here is not visible to a
+ * family reading single-valued options and vice versa; a family declares which
+ * one it wants by the type it puts in its spec. `count` may be 0, which sets an
+ * empty list -- distinct from never setting the key at all. */
+AUDIOCPP_API audiocpp_status audiocpp_request_set_option_array(audiocpp_request * request,
+                                                               const char * key,
+                                                               const char * const * values,
+                                                               size_t count);
 
 /* ------------------------------------------------------------------ */
 /* Result                                                              */
