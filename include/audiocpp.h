@@ -55,7 +55,10 @@ extern "C" {
 #define AUDIOCPP_ABI_VERSION_PATCH 0
 
 /* Packed as (major << 16) | (minor << 8) | patch. A caller built against a
- * different MAJOR must not use the library. */
+ * different MAJOR must not use the library. MINOR increments when entry points
+ * are added -- nothing is removed or changed -- so a caller needing a newer one
+ * can require a minimum; PATCH is behaviour only and must not be gated on. See
+ * docs/c_api.md. */
 AUDIOCPP_API uint32_t audiocpp_abi_version(void);
 
 /* audio.cpp's own build version, e.g. "0.2.1". Borrowed, static lifetime. */
