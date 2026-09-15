@@ -117,9 +117,22 @@ struct EncodedInputIds {
     size_t phoneme_count = 0;
 };
 
+/// `reject_unknown` decides what an out-of-vocabulary symbol means, and the answer depends
+/// entirely on who produced the stream.
+///
+/// ⚠ FALSE for our own G2P, TRUE for a caller's. The reference implementation (hexgrad/Kokoro's
+/// KModel, `filter(None, map(vocab.get, phonemes))`) drops what it cannot tokenize, and for our
+/// own output that is the only sane answer: eSpeak emits a syllabic mark for "button" that this
+/// vocabulary has no id for, and nobody downstream can do anything about it.
+///
+/// A CALLER'S stream is the opposite case. They can fix it, so telling them is strictly more
+/// useful than guessing -- and guessing is not harmless here. Canonical IPA writes a diphthong
+/// as two symbols, and Kokoro writes it as one, so dropping the off-glide silently turns
+/// `lˈaᶦk` into `lˈak`: "like" becomes "lack", with no error and audio that sounds deliberate.
 EncodedInputIds encode_input_ids_and_count(
     const std::string & phonemes,
-    const KokoroAssets & assets) {
+    const KokoroAssets & assets,
+    bool reject_unknown) {
     EncodedInputIds encoded;
     encoded.ids.reserve(phonemes.size() + 2);
     encoded.ids.push_back(0);
@@ -149,6 +162,13 @@ EncodedInputIds encode_input_ids_and_count(
         const std::string symbol = phonemes.substr(i, width);
         const auto it = assets.vocab.find(symbol);
         if (it == assets.vocab.end()) {
+            if (reject_unknown) {
+                throw std::runtime_error(
+                    "Kokoro vocab is missing phoneme symbol: " + symbol +
+                    "; supplied phonemes must be in Kokoro's own " + std::to_string(assets.vocab.size()) +
+                    "-symbol vocabulary, which is not canonical IPA -- a diphthong is one symbol there"
+                    " and two in IPA, so an off-glide is a common cause");
+            }
             // Skipped, not fatal, matching the reference implementation: hexgrad/Kokoro's KModel
             // tokenizes with `filter(None, map(vocab.get, phonemes))`, which drops any phoneme the
             // 114-entry vocab has no id for.
@@ -239,7 +259,8 @@ KokoroSynthesisInput build_kokoro_synthesis_input(
     const bool supplied = !phoneme_override.empty();
     const std::string phonemes =
         supplied ? phoneme_override : phonemize_text(text, state.language_code, assets);
-    const EncodedInputIds encoded = encode_input_ids_and_count(phonemes, assets);
+    // Strict for a caller's stream, lenient for our own -- see encode_input_ids_and_count.
+    const EncodedInputIds encoded = encode_input_ids_and_count(phonemes, assets, supplied);
     if (encoded.phoneme_count > 510) {
         // Two different failures wearing one message helps nobody: the caller who supplied the
         // phonemes can fix this by sending less, and is told so; the caller who supplied text
