@@ -248,10 +248,16 @@ void KokoroTTSSession::prepare(const runtime::SessionPreparationRequest & reques
     }
     auto adapter = make_graph_capacity_adapter();
     int64_t request_size = 0;
+    const std::string prepare_phonemes =
+        runtime::find_option(request.options, {"phonemes"}).value_or(std::string());
     if (request.text.has_value()) {
         const int64_t text_chunk_size =
             engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
-        const auto text_chunks = engine::text::split_text_chunks(request.text->text, text_chunk_size);
+        // Supplied phonemes are one stream for the whole request, so chunking the TEXT would
+        // size the graph for a fraction of what run() then feeds it in a single pass.
+        const auto text_chunks = prepare_phonemes.empty()
+            ? engine::text::split_text_chunks(request.text->text, text_chunk_size)
+            : std::vector<std::string>{request.text->text};
         for (const auto & chunk : text_chunks) {
             runtime::SessionPreparationRequest chunk_request = request;
             chunk_request.text = runtime::Transcript{chunk, request.text->language};
@@ -259,7 +265,7 @@ void KokoroTTSSession::prepare(const runtime::SessionPreparationRequest & reques
                 resolve_kokoro_frontend_session_state(chunk_request.text, chunk_request.voice, *assets_);
             request_size = std::max(
                 request_size,
-                estimate_kokoro_request_tokens(chunk_request, frontend_state, *assets_));
+                estimate_kokoro_request_tokens(chunk_request, frontend_state, *assets_, prepare_phonemes));
         }
     }
     graph_capacity_controller_.ensure_prepared(adapter, request_size);
@@ -275,7 +281,15 @@ runtime::TaskResult KokoroTTSSession::run(const runtime::TaskRequest & request) 
 
     const int64_t text_chunk_size =
         engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
-    const auto chunk_requests = runtime::chunk_text_request(request, text_chunk_size);
+    // ⚠ A SUPPLIED PHONEME STREAM IS NOT CHUNKED. Chunking splits the TEXT, and there is no
+    // general way to cut a phoneme stream at the matching points — the caller's G2P is the only
+    // thing that knows where they are. So the request runs whole, and the 510-symbol guard in
+    // the frontend tells a caller who sent too much to split it themselves.
+    const std::string supplied_phonemes =
+        runtime::find_option(request.options, {"phonemes"}).value_or(std::string());
+    const auto chunk_requests = supplied_phonemes.empty()
+        ? runtime::chunk_text_request(request, text_chunk_size)
+        : std::vector<runtime::TaskRequest>{request};
     engine::debug::trace_log_scalar("kokoro.text_chunk_size", text_chunk_size);
     engine::debug::trace_log_scalar("kokoro.text_chunk_count", static_cast<int64_t>(chunk_requests.size()));
     double frontend_ms = 0.0;
@@ -291,14 +305,18 @@ runtime::TaskResult KokoroTTSSession::run(const runtime::TaskRequest & request) 
             frontend_state.language_code + ":" +
             std::to_string(frontend_state.speaking_rate) + ":" +
             std::to_string(chunk_request.text_input->text.size()) + ":" +
-            chunk_request.text_input->text;
+            chunk_request.text_input->text + ":" +
+            // Without this, two requests with the same text and different supplied phonemes
+            // would hit the same cache entry and the second would be spoken as the first.
+            supplied_phonemes;
         KokoroSynthesisInput input;
         frontend_ms += measure_ms([&]() {
             if (!cache_key.empty() && cached_input_ && cache_key == cached_request_key_) {
                 input = *cached_input_;
                 return;
             }
-            input = build_kokoro_synthesis_input(*chunk_request.text_input, frontend_state, *assets_);
+            input = build_kokoro_synthesis_input(
+                *chunk_request.text_input, frontend_state, *assets_, supplied_phonemes);
             if (!cache_key.empty()) {
                 cached_request_key_ = cache_key;
                 cached_input_ = std::make_unique<KokoroSynthesisInput>(input);
