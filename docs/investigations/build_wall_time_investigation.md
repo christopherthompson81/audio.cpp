@@ -220,3 +220,83 @@ faster" would misrepresent both.
 The monitor polled every 180 s, so the completion was noticed roughly three
 minutes after it happened and the session sat idle. Poll interval should track
 the expected phase length, not be set once and forgotten.
+
+## Run 4 — 2026-09-15 21:57 — the model set, and where it stops helping
+
+`AUDIOCPP_MODEL_SET=custom` (README:258) compiles only the families asked for.
+Measured on top of the single-arch build, with ccache off so the variable is
+isolated:
+
+```
+-DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=kokoro_tts,parakeet_tdt
+  -- audio.cpp model composite: custom selected [kokoro_tts;parakeet_tdt]
+```
+
+| tree                       | objects | CUDA | C++ | .so  | build |
+|----------------------------|--------:|-----:|----:|-----:|------:|
+| baseline, 9 arch, full     |     953 |  141 | 812 | 201M | 1361 s|
+| 1 arch, full               |     953 |  141 | 812 |  69M |  401 s|
+| 1 arch, 2 families         |     415 |  141 | 274 |  42M |  285 s|
+
+**Finding, as predicted: the 141 CUDA objects are a floor.** ggml's CUDA backend
+is not model-specific, so no model-set choice touches it. The lever moves C++
+only, 812 -> 274, worth a further 29%.
+
+## Run 5 — 2026-09-15 22:09 — all three, and what the release path already does
+
+Combined (1 arch + 2 families + ccache): **cold 292 s, warm 21 s** (95.4% hits).
+
+| configuration                        |  cold | warm rebuild |
+|--------------------------------------|------:|-------------:|
+| baseline                             | 1361 s|       1361 s |
+| + single arch                        |  401 s|        401 s |
+| + single arch + ccache, **full set** |  409 s|     **29 s** |
+| + single arch + custom set + ccache  |  292 s|     **21 s** |
+
+Keeping the **full** model set costs ~117 s cold and ~8 s warm against narrowing
+it. That is a cheap price for not having to think about which families are
+compiled in, and it is the configuration worth recommending.
+
+### ⚠ The default arch list is a recent, deliberate fix — do not revert it
+
+`62735ea` "Fix CUDA arch selection: provide a portable default arch list (#280)",
+2026-08-23:
+
+> Without an explicit CMAKE_CUDA_ARCHITECTURES, enable_language(CUDA)
+> (CMP0104 NEW) seeds it from nvcc's default arch (sm_75 on CUDA 13, sm_52 on
+> CUDA 12) - **it does not query the local GPU** - so every build without an
+> explicit list was single-arch, e.g. sm_75 even on an RTX 5090.
+
+So "make configure detect the GPU" is not a free win: the previous default only
+*looked* like host detection and was in fact nvcc's fixed fallback, producing
+wrong-arch binaries silently. #280's own conclusion is the shape to keep:
+**"portable default, with native or an explicit arch list for fast local
+builds."** Making native *easy* is aligned with that; making it *automatic* is
+not.
+
+### A stale comment found while checking this
+
+`.github/workflows/release.yml:501` still says:
+
+> CMAKE_CUDA_ARCHITECTURES must be pinned: audio.cpp defaults to "native" (the
+> build host GPU), which is meaningless on GPU-less CI runners...
+
+Both halves are now false — the default is the portable list, and the old
+default never queried the host GPU either. The *conclusion* (pin it) is still
+right, for a different reason. Worth a one-line correction.
+
+Every release path does pin it, which is the safety evidence that mattered here:
+`release.yml:271`, `release.yml:514`, `scripts/build_linux.sh:420`,
+`scripts/build_windows.ps1:632`.
+
+### ccache is switched off by a line that reads like a local hack
+
+`CMakeLists.txt:316`:
+
+```cmake
+set(GGML_CCACHE OFF CACHE BOOL "Do not probe for ccache in this local setup" FORCE)
+```
+
+Upstream ggml probes for ccache and uses it when found. This turns that off for
+everybody, and `FORCE` means no `-D` can override it. On the measurements above
+that line costs a 14x rebuild for no stated benefit.
