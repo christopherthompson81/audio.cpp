@@ -168,3 +168,55 @@ proposals, and only the second needs to survive a reviewer with a different GPU.
 for Ninja on a tree this size — faster no-op and incremental rebuilds — does not
 apply, because there is nothing to win. Dropped as a lever; it would have been
 invisible had the runner only timed full builds.
+
+## Run 3 — 2026-09-15 21:48 — the linker is not the problem, and ccache is
+
+### Linker: bounded, then dropped
+
+Deleted the shared object and timed the relink alone, in both trees:
+
+```
+201 MB .so (9 arch)   relink_s=2      "Linking CXX shared library bin/libaudiocpp.so"
+ 69 MB .so (1 arch)   relink_s=1
+```
+
+**Finding: linking is 2 seconds of a 1361-second build — 0.15%.** An
+*instantaneous* linker would save 0.15%. `mold` and `lld` are both absent from
+this host and installing either needs root; on this evidence there is no reason
+to ask. Lever dropped, cheaply, before anyone was inconvenienced.
+
+### ccache: 2% to pay, 93% to gain
+
+ccache 4.9.1 is installed and this build never calls it (Run 0). Wired via
+`CMAKE_{C,CXX,CUDA}_COMPILER_LAUNCHER`, which bypasses the forced
+`GGML_CCACHE OFF`, with an isolated `CCACHE_DIR` so the host's own 3685-entry
+cache was neither read nor cleared.
+
+| phase | build | hit rate | vs no ccache (401 s) |
+|-------|------:|---------:|---------------------:|
+| cold cache, empty     | 409 s |   3/951  (0.32%) | **+8 s (2% tax)** |
+| warm cache, build dir destroyed |  **29 s** | 932/951 (98.00%) | **-93%, 14x** |
+
+Cache footprint for the whole tree: **0.1 GB**.
+
+**Finding: a from-scratch rebuild goes from 6.7 minutes to 29 seconds.** The
+2% cold-build tax is the entire downside, and it is paid once per genuinely new
+compilation rather than per build.
+
+This is the lever for the case the arch list does not help: blow away `build/`,
+switch branches and come back, bisect, or reconfigure with different options.
+Those are all full rebuilds today and all near-free with a warm cache.
+
+### ⚠ The two levers answer different questions
+
+- arch list -> a **cold** build, 3.4x
+- ccache    -> a **rebuild**, 14x
+
+Neither substitutes for the other, and quoting one number as "the build got
+faster" would misrepresent both.
+
+### Process note
+
+The monitor polled every 180 s, so the completion was noticed roughly three
+minutes after it happened and the session sat idle. Poll interval should track
+the expected phase length, not be set once and forgotten.
