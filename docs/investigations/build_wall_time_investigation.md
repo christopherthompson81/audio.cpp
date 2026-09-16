@@ -281,9 +281,9 @@ not.
 > CMAKE_CUDA_ARCHITECTURES must be pinned: audio.cpp defaults to "native" (the
 > build host GPU), which is meaningless on GPU-less CI runners...
 
-Both halves are now false — the default is the portable list, and the old
-default never queried the host GPU either. The *conclusion* (pin it) is still
-right, for a different reason. Worth a one-line correction.
+⚠ **I first wrote that both halves were false. That was wrong — see Run 6.**
+The comment was accurate when written: the pre-#280 code really did set
+`native`. Only the first half is stale now (the default is the portable list).
 
 Every release path does pin it, which is the safety evidence that mattered here:
 `release.yml:271`, `release.yml:514`, `scripts/build_linux.sh:420`,
@@ -300,3 +300,68 @@ set(GGML_CCACHE OFF CACHE BOOL "Do not probe for ccache in this local setup" FOR
 Upstream ggml probes for ccache and uses it when found. This turns that off for
 everybody, and `FORCE` means no `-D` can override it. On the measurements above
 that line costs a 14x rebuild for no stated benefit.
+
+## Run 6 — 2026-09-15 22:20 — what #280 actually replaced, and a correction
+
+Read the diff rather than the commit message, because Run 5 drew a conclusion
+from the message alone and got it wrong.
+
+### The correction
+
+Run 5 said the release.yml comment was false in both halves, and that the old
+default "never queried the host GPU either". **Wrong.** #280 deleted this, at
+the bottom of the CUDA block:
+
+```cmake
+if (CMAKE_CUDA_ARCHITECTURES)
+    set_target_properties(engine_runtime PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+else()
+    set_target_properties(engine_runtime PROPERTIES CUDA_ARCHITECTURES native)
+endif()
+```
+
+The old code *did* set `native`. The comment was accurate when it was written.
+
+The mistake was reading the commit message as a complete account of the old
+behaviour. It describes what `enable_language(CUDA)` seeds the **global
+variable** to; it says nothing about the **target property** being separately
+forced to `native`, because that is the line being removed rather than the bug
+being explained.
+
+### The flaw was worse than either description on its own
+
+That block was the only occurrence of `CUDA_ARCHITECTURES` in the pre-#280 tree,
+and it named one target. So a build with no explicit arch list was split-brain:
+
+| target                      | architecture built for                        |
+|-----------------------------|-----------------------------------------------|
+| `engine_runtime`            | `native` — the real host GPU                   |
+| everything else (ggml-cuda) | nvcc's fallback — sm_75 (CUDA 13), sm_52 (12)  |
+
+One binary, two different ideas of the target hardware, and neither chosen on
+purpose. On a GPU-less CI runner `native` has nothing to detect while ggml-cuda
+compiles for sm_52 regardless — precisely the "unreliable CUDA fatbin" the CI
+comment complains about. **The objection matched a real defect.**
+
+### What this changes about the recommendation
+
+It *strengthens* the case for leaving the default alone, and it explains why
+#280 put the selection before `enable_language(CUDA)` and applied it globally:
+a single decision for every CUDA target, taken early, instead of one target
+disagreeing with the rest.
+
+It also makes today's `native` safer than the one that was removed. #280 kept a
+resolution path with an explicit no-GPU case:
+
+```cmake
+# Resolve "native" for the log; left as-is when no GPU was detected
+# (nvcc then warns and uses its default arch).
+```
+
+So `native` on a GPU-less host now degrades noisily to nvcc's default for
+everything, rather than splitting. Better — but still nvcc's default, which is
+the bug #280 existed to fix. Opt-in, not automatic.
+
+**Only the stale half of the release.yml comment needs fixing**: the default is
+the portable list now, not `native`. Its conclusion — pin the arch for releases
+— is still correct, and so was its original reasoning.
