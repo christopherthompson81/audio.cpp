@@ -238,6 +238,10 @@ if (ENGINE_ENABLE_CUDA AND NOT ENGINE_ENABLE_HIP)
 
     # Define default archs
     if ("${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "" AND "$ENV{CUDAARCHS}" STREQUAL "")
+        # Remembered so the summary below can tell the difference between "the
+        # portable list is what you asked for" and "the portable list is what you
+        # got by not asking".
+        set(_AUDIOCPP_CUDA_ARCH_DEFAULTED TRUE)
         # XX-virtual = PTX (JIT, forward-compatible); XX-real = SASS (native).
         if (CUDAToolkit_VERSION VERSION_LESS "13")
             # 50/61/70 (Maxwell/Pascal/Volta) unsupported by CUDA 13 toolkits
@@ -279,6 +283,27 @@ if (ENGINE_ENABLE_CUDA AND NOT ENGINE_ENABLE_HIP)
         set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
     endif()
     message(STATUS "Using CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} CMAKE_CUDA_ARCHITECTURES_NATIVE=${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+
+    # ⚠ The line above already knows both halves of this and says neither: how many
+    # architectures are about to be compiled, and which one this host can actually
+    # run. Printing the data without the consequence is how a 3x build cost goes
+    # unnoticed for months by people who have read the docs.
+    if (_AUDIOCPP_CUDA_ARCH_DEFAULTED AND
+        CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "^[0-9]")
+        list(LENGTH CMAKE_CUDA_ARCHITECTURES _AUDIOCPP_ARCH_COUNT)
+        message(STATUS "  portable default: ${_AUDIOCPP_ARCH_COUNT} architectures, so every .cu file is compiled ${_AUDIOCPP_ARCH_COUNT} times")
+        message(STATUS "  this host is ${CMAKE_CUDA_ARCHITECTURES_NATIVE}; for a local build roughly 3x faster:")
+        message(STATUS "      -DCMAKE_CUDA_ARCHITECTURES=native    (the result then runs on this GPU only)")
+    endif()
+
+    # Same principle: ccache is either helping or it is sitting there unused, and
+    # the build is the only thing in a position to notice which.
+    find_program(_AUDIOCPP_CCACHE ccache)
+    if (_AUDIOCPP_CCACHE AND
+        NOT CMAKE_CXX_COMPILER_LAUNCHER AND NOT CMAKE_CUDA_COMPILER_LAUNCHER)
+        message(STATUS "  ccache is installed (${_AUDIOCPP_CCACHE}) and NOT in use; a rebuild is ~14x faster with:")
+        message(STATUS "      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache")
+    endif()
 
     if (NOT MSVC)
         set(CMAKE_CUDA_FLAGS_DEBUG "${AUDIOCPP_DEBUG_OPT_FLAGS}" CACHE STRING "Optimized debug CUDA flags" FORCE)

@@ -365,3 +365,79 @@ the bug #280 existed to fix. Opt-in, not automatic.
 **Only the stale half of the release.yml comment needs fixing**: the default is
 the portable list now, not `native`. Its conclusion — pin the arch for releases
 — is still correct, and so was its original reasoning.
+
+## Run 7 — 2026-09-15 22:24 — the real defect is that configure does not say
+
+### Two corrections first
+
+Run 5 and my reporting of it were wrong twice, both by reading less than I
+claimed to have read:
+
+1. "The old default never queried the host GPU" — false, corrected in Run 6.
+2. "The arch knob is not documented in the build docs" — **false.** #280
+   documented it in `README.md` and `docs/build/linux.md`, and gave
+   `scripts/build_linux.sh` a first-class `--cuda-arch` flag:
+
+   > Without `--cuda-arch`, CUDA builds use the portable arch list (works on
+   > many GPUs, slower to build). For a faster build targeting only the local
+   > GPU, pass `--cuda-arch native`...
+
+   I had grepped `docs/*.md`, and the file is `docs/build/linux.md`.
+
+So the "add a preset and document it" deliverable was mostly redundant. #280
+already did the documenting, and did it well.
+
+### And yet every build here was the slow one
+
+Which is the finding. The fast path is documented, named, and flagged, and it
+was still missed for months of builds by someone who had read the build docs.
+That is not an information problem, it is a **defaults-and-feedback** problem.
+
+Look at what configure already prints:
+
+```
+-- Using CMAKE_CUDA_ARCHITECTURES=50-virtual;...;120a-real CMAKE_CUDA_ARCHITECTURES_NATIVE=86-real
+```
+
+Both halves are on that line, adjacent: nine architectures about to be
+compiled, and the one this host can run. It prints the **data** and withholds
+the **consequence**. Nothing on screen says the first costs 3x, or that the
+second is an option.
+
+ccache is worse, because nothing is printed at all: `/usr/bin/ccache` exists,
+`CMakeLists.txt:316` forces the probe off, and configure knows both.
+
+### The change: say it, at the moment both facts are known
+
+```
+-- Using CMAKE_CUDA_ARCHITECTURES=50-virtual;...;120a-real CMAKE_CUDA_ARCHITECTURES_NATIVE=86-real
+--   portable default: 9 architectures, so every .cu file is compiled 9 times
+--   this host is 86-real; for a local build roughly 3x faster:
+--       -DCMAKE_CUDA_ARCHITECTURES=native    (the result then runs on this GPU only)
+--   ccache is installed (/usr/bin/ccache) and NOT in use; a rebuild is ~14x faster with:
+--       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+```
+
+No default changes. Nothing to remember, nothing to look up, and it arrives
+unbidden at the only moment anyone is deciding.
+
+**Verified silent when already correct** — configure with `native` plus the
+three launchers prints neither hint (`grep -c` = 0). A hint that fires after you
+have complied is nagging, and gets filtered out mentally along with the real
+ones.
+
+**Guarded for the GPU-less case by construction:** the arch hint requires
+`CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "^[0-9]"`, so a build host with no GPU
+is never told to use `native` — which is exactly the configuration #280 exists
+to protect. ⚠ Reasoned, not measured: every machine available here has a GPU.
+
+### Why a hint rather than changing the default
+
+Because a GPU being present does not mean it is the target. Build servers have
+GPUs; building on a 3090 to deploy on an A100 under a native default yields a
+binary that silently will not run — the same class of failure #280 fixed, with
+a different wrong answer. Auto-detection cannot tell "my desktop" from "the
+build host". A hint puts the choice in front of the person who does know.
+
+ccache is the exception and should simply be on when found, which is what
+upstream ggml does and what `CMakeLists.txt:316` overrides with `FORCE`.
