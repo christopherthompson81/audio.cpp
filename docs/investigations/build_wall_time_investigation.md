@@ -104,3 +104,67 @@ host but deprecated by the toolkit that is compiling them.
 remaining runs by information per minute rather than by tidiness: the
 architecture list first, since its effect is both the largest and the one that
 can be predicted from first principles, and the generator after.
+
+## Run 2 — 2026-09-15 21:37 — the architecture list, measured
+
+Same tree, same options, one variable changed:
+
+```
+cmake -S . -B e2-make-native ... -DCMAKE_CUDA_ARCHITECTURES=86-real
+  -- Using CMAKE_CUDA_ARCHITECTURES=86-real
+  --generate-code entries per CUDA TU: 9 -> 1
+```
+
+|                    | baseline (9 arch) | one arch | change |
+|--------------------|------------------:|---------:|-------:|
+| full build         |           1361 s  |   401 s  | **-70.5%, 3.4x** |
+| no-op rebuild      |              1 s  |     0 s  | – |
+| build tree         |            1.4 G  |   638 M  | -56% |
+| `libaudiocpp.so`   |            201 M  |    69 M  | **-66%** |
+| objects / CUDA objs|        953 / 141  | 953 / 141| identical |
+
+**Finding: 22.7 minutes becomes 6.7, and the artifact gets three times smaller.**
+
+### Why it beats the naive estimate
+
+CUDA is ~70% of the baseline's wall time, so removing 8/9 of that work predicts
+about -62%. The measured -70.5% is better, and the process census says why.
+
+```
+baseline, first 17 min:   cicc=16  cc1plus=0     <- C++ starved
+one arch, 1 min in:       cicc=6   cc1plus=5     <- overlapped
+```
+
+In the baseline the CUDA work saturates all 16 cores and the 779 C++ objects
+cannot start; the C++ tail is *serialised behind* CUDA rather than overlapped
+with it. Cutting the CUDA work does not just remove its own time, it lets the
+rest of the build fill the cores that CUDA was monopolising. That second-order
+effect is the difference between -62% and -70.5%.
+
+### ⚠ A fast build of a broken artifact would be worth nothing
+
+So the single-arch `.so` was run, not just weighed — the same C model test the
+suite uses, forced onto the CUDA backend:
+
+```
+$ audiocpp_c_api_model_test /mnt/data/models/audiocpp sample_16k.wav cuda ...
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24090 MiB)
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+parity:kokoro_tts:audio_rate=24000  audio_seconds=3.275  audio_peak=0.3531
+parity:parakeet_tdt:text=Some call me Nature. Others call me Mother Nature...
+ran=5 skipped=0 failures=0   EXIT=0
+```
+
+Five families, CUDA graphs live, zero failures.
+
+**What it costs.** The resulting binary runs on sm_86 and nothing else — no PTX
+for forward compatibility either, since `86-real` omits it. That is correct for
+a local development loop and wrong as a repository default. Two different
+proposals, and only the second needs to survive a reviewer with a different GPU.
+
+### Negative result: the generator is not the problem here
+
+`noop_s` is **1 second** for Unix Makefiles on 953 objects. The usual argument
+for Ninja on a tree this size — faster no-op and incremental rebuilds — does not
+apply, because there is nothing to win. Dropped as a lever; it would have been
+invisible had the runner only timed full builds.
