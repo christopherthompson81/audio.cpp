@@ -218,6 +218,54 @@ export async function runTask(body: Record<string, unknown>, signal?: AbortSigna
   }, signal);
 }
 
+export interface StoredAdapter {
+  file: string;
+  path: string;          // "loras/<file>", the value a session option takes
+  bytes: number;
+  branch: string;        // "ar" | "nar" | "both" | "unknown"
+  layout: string;        // "unfused" | "comfyui" | "not-an-adapter" | "unreadable"
+  loadable: boolean;
+  rank?: string;
+  base_model?: string;
+  note?: string;
+  repo_file?: string;    // browse results only: the path within the repo
+}
+
+// Adapters stored beside a model, in <model>/loras/. Unlike /v1/ui/upload these
+// survive a server restart.
+export async function listAdapters(model: string): Promise<{ directory: string; adapters: StoredAdapter[] }> {
+  return jsonRequest(`/v1/ui/loras?model=${encodeURIComponent(model)}`);
+}
+
+export async function uploadAdapter(file: File, model: string, signal?: AbortSignal): Promise<StoredAdapter> {
+  return jsonRequest<StoredAdapter>('/v1/ui/loras/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': file.type || 'application/octet-stream',
+      'X-AudioCPP-Filename': file.name,
+      'X-AudioCPP-Model': model
+    },
+    body: file
+  }, signal);
+}
+
+export async function deleteAdapter(model: string, file: string): Promise<void> {
+  await jsonRequest('/v1/ui/loras/delete', { method: 'POST', body: JSON.stringify({ model, file }) });
+}
+
+// Lists a Hugging Face repo's safetensors and classifies each from its header,
+// read with a ranged request so nothing large is downloaded to find out.
+export async function browseAdapterRepo(repo: string, signal?: AbortSignal): Promise<{ repo: string; adapters: StoredAdapter[] }> {
+  return jsonRequest('/v1/ui/loras/browse', { method: 'POST', body: JSON.stringify({ repo }) }, signal);
+}
+
+export async function downloadAdapter(repo: string, file: string, model: string, signal?: AbortSignal): Promise<StoredAdapter> {
+  return jsonRequest<StoredAdapter>('/v1/ui/loras/download', {
+    method: 'POST',
+    body: JSON.stringify({ repo, file, model })
+  }, signal);
+}
+
 export function base64AudioUrl(data: string): string {
   const binary = atob(data);
   const bytes = new Uint8Array(binary.length);

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
-  import { jsonRequest, loadModel, models, runTask, unloadModel, uploadFile } from '$lib/api';
+  import { browseAdapterRepo, deleteAdapter, downloadAdapter, jsonRequest, listAdapters,
+    loadModel, models, runTask, unloadModel, uploadAdapter, uploadFile } from '$lib/api';
+  import type { StoredAdapter } from '$lib/api';
   import MediaPreview from '$lib/MediaPreview.svelte';
   import type { Translator } from '$lib/i18n';
   import type { CatalogEntry, LoadedModel, ParamSpec, ServerHealth } from '$lib/types';
@@ -47,32 +49,150 @@
   ];
 
   let coverAudioFile: File | null = null;
-  let loraInput: HTMLInputElement | null = null;
   let loraError = '';
   let loraUpload: AbortController | null = null;
-  onDestroy(() => loraUpload?.abort());
+  let narLoraError = '';
+  let narLoraUpload: AbortController | null = null;
 
-  async function selectLora(file: File | null) {
+  // Adapters stored in <model>/loras/. These persist across restarts, unlike the
+  // temporary /v1/ui/upload path the old free-text field relied on.
+  type LoraSlot = {
+    name: 'ar_lora' | 'nar_lora';
+    scale: 'ar_lora_scale' | 'nar_lora_scale';
+    branch: 'ar' | 'nar';
+    title: string;
+    blurb: string;
+  };
+  const loraSlots: LoraSlot[] = [
+    { name: 'ar_lora', scale: 'ar_lora_scale', branch: 'ar', title: 'AR LoRA',
+      blurb: 'Changes what gets composed \u2014 melody, structure, arrangement.' },
+    { name: 'nar_lora', scale: 'nar_lora_scale', branch: 'nar', title: 'NAR LoRA',
+      blurb: 'Changes how it is rendered \u2014 the sound, not the notes.' }
+  ];
+  // Svelte cannot bind:this to a ternary, so the two file inputs are keyed.
+  let loraInputs: Record<string, HTMLInputElement | null> = {};
+  let stored: StoredAdapter[] = [];
+  let storeDirectory = '';
+  let storeError = '';
+  let repoId = '';
+  let repoAdapters: StoredAdapter[] = [];
+  let repoBusy = false;
+  let repoError = '';
+  let repoNotice = '';
+  let downloading = '';
+  let browseRequest: AbortController | null = null;
+  onDestroy(() => { loraUpload?.abort(); narLoraUpload?.abort(); browseRequest?.abort(); });
+
+  $: adaptersFor = (branch: 'ar' | 'nar') =>
+    stored.filter((a) => a.loadable && (a.branch === branch || a.branch === 'both' || a.branch === 'unknown'));
+
+  function megabytes(bytes: number) {
+    return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(2)} GB` : `${Math.round(bytes / 1e6)} MB`;
+  }
+
+  function adapterOptionLabel(adapter: StoredAdapter) {
+    const rank = adapter.rank ? `, rank ${adapter.rank}` : '';
+    return `${adapter.file} (${megabytes(adapter.bytes)}${rank})`;
+  }
+
+  async function refreshStored() {
+    storeError = '';
+    const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
+    if (!entry) return;
+    try {
+      const result = await listAdapters(modelPathFor(entry));
+      stored = result.adapters;
+      storeDirectory = result.directory;
+    } catch (error) {
+      storeError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  onMount(refreshStored);
+
+  async function browseRepo() {
+    repoError = ''; repoNotice = ''; repoAdapters = [];
+    const repo = repoId.trim();
+    if (!repo) return;
+    repoBusy = true;
+    browseRequest?.abort();
+    browseRequest = new AbortController();
+    try {
+      const result = await browseAdapterRepo(repo, browseRequest.signal);
+      repoAdapters = result.adapters;
+      const usable = repoAdapters.filter((a) => a.loadable).length;
+      repoNotice = usable
+        ? `${usable} of ${repoAdapters.length} files in ${repo} can be loaded here.`
+        : `None of the ${repoAdapters.length} safetensors in ${repo} are unfused adapters this engine can load.`;
+    } catch (error) {
+      if (!browseRequest.signal.aborted) repoError = error instanceof Error ? error.message : String(error);
+    } finally {
+      repoBusy = false; browseRequest = null;
+    }
+  }
+
+  async function fetchAdapter(adapter: StoredAdapter) {
+    const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
+    if (!entry || !adapter.repo_file) return;
+    repoError = '';
+    downloading = adapter.repo_file;
+    try {
+      const saved = await downloadAdapter(repoId.trim(), adapter.repo_file, modelPathFor(entry));
+      await refreshStored();
+      // Select what was just fetched, into whichever field it belongs to.
+      setNamedParameter(saved.branch === 'ar' ? 'ar_lora' : 'nar_lora', saved.path);
+      repoNotice = `Stored ${saved.file}. Reload the model to apply it.`;
+    } catch (error) {
+      repoError = error instanceof Error ? error.message : String(error);
+    } finally {
+      downloading = '';
+    }
+  }
+
+  async function removeAdapter(file: string, name: 'ar_lora' | 'nar_lora') {
+    const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
+    if (!entry) return;
+    try {
+      await deleteAdapter(modelPathFor(entry), file);
+      if (String(advancedValues[name] ?? '') === `loras/${file}`) setNamedParameter(name, '');
+      await refreshStored();
+    } catch (error) {
+      storeError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  // Both adapters upload through the same route; `name` picks which field and which
+  // error slot they land in. The engine rejects anything but an unfused .safetensors
+  // (yue2/lora.cpp), so the extension check is the one thing worth catching early --
+  // the `_comfyui` files in the upstream adapter repos are fused and will not load.
+  async function selectLora(file: File | null, name: 'ar_lora' | 'nar_lora' = 'ar_lora') {
     if (!file) return;
-    loraError = '';
+    const isNar = name === 'nar_lora';
+    const setError = (message: string) => { if (isNar) narLoraError = message; else loraError = message; };
+    setError('');
     if (!file.name.toLowerCase().endsWith('.safetensors')) {
-      loraError = 'Select an unfused AR .safetensors adapter.';
+      setError(`Select an unfused ${isNar ? 'NAR' : 'AR'} .safetensors adapter.`);
       return;
     }
     loraUploading = true;
-    loraUpload = new AbortController();
+    const upload = new AbortController();
+    if (isNar) narLoraUpload = upload; else loraUpload = upload;
     try {
-      const path = await uploadFile(file, loraUpload.signal);
-      setNamedParameter('ar_lora', path);
-      log(`YuE2 AR LoRA selected: ${file.name}`);
+      const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
+      if (!entry) throw new Error('no YuE2 model in the catalog to store the adapter beside');
+      const saved = await uploadAdapter(file, modelPathFor(entry), upload.signal);
+      await refreshStored();
+      setNamedParameter(name, saved.path);
+      log(`YuE2 ${isNar ? 'NAR' : 'AR'} LoRA stored: ${saved.file}`);
     } catch (error) {
-      if (!loraUpload.signal.aborted) {
-        loraError = error instanceof Error ? error.message : String(error);
+      if (!upload.signal.aborted) {
+        setError(error instanceof Error ? error.message : String(error));
       }
     } finally {
       loraUploading = false;
-      loraUpload = null;
-      if (loraInput) loraInput.value = '';
+      if (isNar) narLoraUpload = null; else loraUpload = null;
+      const input = loraInputs[name];
+      if (input) input.value = '';
     }
   }
   let coverAudioInput: HTMLInputElement | null = null;
@@ -294,38 +414,100 @@
     {/each}
   </div>
 
-  {#if specByName('ar_lora')}
+  {#if specByName('ar_lora') || specByName('nar_lora')}
     <div class="yue2-grid">
-      <div class="yue2-field">
-        <label for="param-ar_lora">AR LoRA adapter</label>
-        <input id="param-ar_lora" type="text" placeholder="Server path (.safetensors)"
-          disabled={!server?.ui_management || busy || loraUploading}
-          value={String(advancedValues.ar_lora ?? '')}
-          on:input={(event) => setNamedParameter('ar_lora', event.currentTarget.value.trim())} />
-        <input id="yue2-ar-lora-file" class="file file-native" type="file" accept=".safetensors"
-          bind:this={loraInput} disabled={!server?.ui_management || busy || loraUploading}
-          on:change={(event) => selectLora(event.currentTarget.files?.[0] || null)} />
-        <div class="media-actions">
-          <button type="button" disabled={!server?.ui_management || busy || loraUploading}
-            on:click={() => loraInput?.click()}>{loraUploading ? 'Uploading...' : 'Choose AR LoRA'}</button>
-          <button type="button" disabled={!server?.ui_management || busy || loraUploading || !advancedValues.ar_lora}
-            on:click={() => { setNamedParameter('ar_lora', ''); loraError = ''; }}>Clear</button>
-        </div>
-        <small>LoRA requirements vary. Read the original adapter's documentation for usage instructions.</small>
-        {#if loraError}<span class="yue2-error" role="alert">{loraError}</span>{/if}
-      </div>
-      <div class="yue2-field">
-        <label for="param-ar_lora_scale">AR LoRA strength</label>
-        <input id="param-ar_lora_scale" type="number" step="0.1"
-          disabled={!server?.ui_management || busy || loraUploading || !advancedValues.ar_lora}
-          value={Number(advancedValues.ar_lora_scale ?? 1)}
-          on:change={(event) => {
-            if (Number.isFinite(event.currentTarget.valueAsNumber)) {
-              setNamedParameter('ar_lora_scale', event.currentTarget.valueAsNumber);
-            }
-          }} />
-      </div>
+      {#each loraSlots as slot}
+        {#if specByName(slot.name)}
+          <div class="yue2-field">
+            <label for={'param-' + slot.name}>{slot.title} adapter</label>
+            <select id={'param-' + slot.name}
+              disabled={!server?.ui_management || busy || loraUploading}
+              value={String(advancedValues[slot.name] ?? '')}
+              on:change={(event) => setNamedParameter(slot.name, event.currentTarget.value)}>
+              <option value="">None</option>
+              {#each adaptersFor(slot.branch) as adapter}
+                <option value={adapter.path}>{adapterOptionLabel(adapter)}</option>
+              {/each}
+              {#if advancedValues[slot.name] && !stored.some((a) => a.path === advancedValues[slot.name])}
+                <option value={String(advancedValues[slot.name])}>{String(advancedValues[slot.name])}</option>
+              {/if}
+            </select>
+            <small>{slot.blurb}</small>
+            <input class="file file-native" type="file" accept=".safetensors"
+              bind:this={loraInputs[slot.name]}
+              disabled={!server?.ui_management || busy || loraUploading}
+              on:change={(event) => selectLora(event.currentTarget.files?.[0] || null, slot.name)} />
+            <div class="media-actions">
+              <button type="button" disabled={!server?.ui_management || busy || loraUploading}
+                on:click={() => loraInputs[slot.name]?.click()}>
+                {loraUploading ? 'Uploading...' : 'Upload a file'}</button>
+              <button type="button"
+                disabled={!server?.ui_management || busy || loraUploading || !advancedValues[slot.name]}
+                on:click={() => setNamedParameter(slot.name, '')}>Clear</button>
+              {#if String(advancedValues[slot.name] ?? '').startsWith('loras/')}
+                <button type="button" disabled={!server?.ui_management || busy}
+                  on:click={() => removeAdapter(String(advancedValues[slot.name]).slice(6), slot.name)}>Delete stored</button>
+              {/if}
+            </div>
+            {#if slot.name === 'ar_lora' && loraError}<span class="yue2-error" role="alert">{loraError}</span>{/if}
+            {#if slot.name === 'nar_lora' && narLoraError}<span class="yue2-error" role="alert">{narLoraError}</span>{/if}
+          </div>
+          <div class="yue2-field">
+            <label for={'param-' + slot.scale}>{slot.title} strength</label>
+            <input id={'param-' + slot.scale} type="number" step="0.1"
+              disabled={!server?.ui_management || busy || loraUploading || !advancedValues[slot.name]}
+              value={Number(advancedValues[slot.scale] ?? 1)}
+              on:change={(event) => {
+                if (Number.isFinite(event.currentTarget.valueAsNumber)) {
+                  setNamedParameter(slot.scale, event.currentTarget.valueAsNumber);
+                }
+              }} />
+            {#if slot.name === 'nar_lora'}
+              <small>Scales the LoRA deltas only; full vae2llm/llm2vae replacements stay at full strength. 0 disables the whole adapter.</small>
+            {:else}
+              <small>0 disables the adapter.</small>
+            {/if}
+          </div>
+        {/if}
+      {/each}
     </div>
+
+    <details class="yue2-details yue2-lora-fetch">
+      <summary>Get adapters from Hugging Face <span>{stored.length} stored</span></summary>
+      <div class="yue2-field wide">
+        <label for="yue2-lora-repo">Repository</label>
+        <div class="media-actions">
+          <input id="yue2-lora-repo" type="text" placeholder="owner/model, e.g. Mothersuperior/YuE2-instrumental-cot-full-loras"
+            bind:value={repoId} disabled={!server?.ui_management || repoBusy}
+            on:keydown={(event) => { if (event.key === 'Enter') browseRepo(); }} />
+          <button type="button" disabled={!server?.ui_management || repoBusy || !repoId.trim()}
+            on:click={browseRepo}>{repoBusy ? 'Reading...' : 'List adapters'}</button>
+        </div>
+        <small>Each file is identified by reading its header, so nothing large is downloaded to find out what it is. Only adapters this engine can load are offered.</small>
+        {#if repoError}<span class="yue2-error" role="alert">{repoError}</span>{/if}
+        {#if repoNotice}<small>{repoNotice}</small>{/if}
+      </div>
+      {#if repoAdapters.length}
+        <div class="yue2-field wide">
+          {#each repoAdapters.filter((a) => a.loadable) as adapter}
+            <div class="media-actions">
+              <button type="button"
+                disabled={!server?.ui_management || Boolean(downloading) || stored.some((a) => a.file === adapter.file)}
+                on:click={() => fetchAdapter(adapter)}>
+                {downloading === adapter.repo_file ? 'Downloading...'
+                  : stored.some((a) => a.file === adapter.file) ? 'Stored' : 'Download'}</button>
+              <span>{adapter.file} &middot; {adapter.branch.toUpperCase()} &middot; {megabytes(adapter.bytes)}{adapter.rank ? ` · rank ${adapter.rank}` : ''}</span>
+            </div>
+          {/each}
+          {#if repoAdapters.some((a) => !a.loadable)}
+            <small>{repoAdapters.filter((a) => !a.loadable).length} other file(s) in this repo are not loadable here (ComfyUI layouts, or other components).</small>
+          {/if}
+        </div>
+      {/if}
+      {#if storeDirectory}<small>Stored in {storeDirectory}</small>{/if}
+      {#if storeError}<span class="yue2-error" role="alert">{storeError}</span>{/if}
+    </details>
+
   {/if}
 
   <div class="yue2-grid yue2-grid-core">
@@ -570,6 +752,33 @@
 
   .yue2-details > .yue2-grid {
     padding: 0 10px 10px;
+  }
+
+  /* This section holds bare fields rather than a .yue2-grid, so it needs the
+     same horizontal inset the grid-based sections get. */
+  .yue2-lora-fetch > .yue2-field,
+  .yue2-lora-fetch > small,
+  .yue2-lora-fetch > .yue2-error {
+    display: block;
+    padding: 0 10px 10px;
+  }
+
+  .yue2-lora-fetch > .yue2-field + .yue2-field {
+    padding-top: 2px;
+  }
+
+  /* A direct child, so it misses the .yue2-field small styling and would
+     otherwise render louder than the helper text it sits beneath. */
+  .yue2-lora-fetch > small {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 500;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .yue2-lora-fetch > :last-child {
+    padding-bottom: 12px;
   }
 
   .yue2-cover {

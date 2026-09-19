@@ -17,6 +17,10 @@
 #include "engine/framework/runtime/errors.h"
 #include "engine/framework/runtime/registry.h"
 
+#if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
+#include "lora_store.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1169,6 +1173,23 @@ HttpResponse ServerState::handle_request(const HttpRequest & request, bool use_f
         response = handle_ui_upload(request);
     }
 #if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
+    else if (request.method == "GET" && request.path == "/v1/ui/loras") {
+        response = handle_lora_list(request);
+    }
+    else if (request.method == "POST" && request.path == "/v1/ui/loras/upload") {
+        response = handle_lora_upload(request);
+    }
+    else if (request.method == "POST" && request.path == "/v1/ui/loras/delete") {
+        response = handle_lora_delete(request.body);
+    }
+    else if (request.method == "POST" && request.path == "/v1/ui/loras/browse") {
+        response = handle_lora_browse(request.body);
+    }
+    else if (request.method == "POST" && request.path == "/v1/ui/loras/download") {
+        response = handle_lora_download(request.body);
+    }
+#endif
+#if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
     else if (request.method == "GET" && request.path == "/v1/ui/models-root") {
         response = handle_models_root_get();
     }
@@ -1460,6 +1481,204 @@ HttpResponse ServerState::handle_ui_upload(const HttpRequest & request) {
         "{\"path\":" + json_quote(path.string()) +
         ",\"bytes\":" + std::to_string(request.body.size()) + "}");
 }
+
+#if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
+namespace {
+
+std::string adapter_json(const minitts::server::AdapterInfo & info) {
+    std::string out = "{\"file\":" + json_quote(info.file) +
+        ",\"path\":" + json_quote(info.relative_path) +
+        ",\"bytes\":" + std::to_string(info.bytes) +
+        ",\"branch\":" + json_quote(info.branch) +
+        ",\"layout\":" + json_quote(info.layout) +
+        ",\"loadable\":" + std::string(info.loadable ? "true" : "false");
+    if (!info.rank.empty()) out += ",\"rank\":" + json_quote(info.rank);
+    if (!info.base_model.empty()) out += ",\"base_model\":" + json_quote(info.base_model);
+    if (!info.note.empty()) out += ",\"note\":" + json_quote(info.note);
+    return out + "}";
+}
+
+}  // namespace
+
+// Resolve the adapter directory for a caller-supplied model path, refusing
+// anything that would land outside the models root.
+//
+// ⚠ resolve_ui_model_path() deliberately passes absolute paths through and does
+// not confine relative ones -- that is fine for the handlers that READ a model
+// the operator configured, but these handlers CREATE and DELETE files at a path
+// the browser chooses. Without this check a request could write a multi-gigabyte
+// file, or delete one, anywhere the server process can, and ui_management has no
+// authentication of its own.
+std::optional<std::filesystem::path> ServerState::resolve_adapter_directory(
+    const std::string & model) const {
+    if (model.empty()) return std::nullopt;
+    const auto resolved = resolve_ui_model_path(std::filesystem::u8path(model));
+    const auto directory = minitts::server::adapter_directory(resolved).lexically_normal();
+    const auto root = models_root_.lexically_normal();
+    if (root.empty()) return std::nullopt;
+    auto candidate = directory.begin();
+    for (auto part = root.begin(); part != root.end(); ++part, ++candidate) {
+        if (candidate == directory.end() || *candidate != *part) return std::nullopt;
+    }
+    return directory;
+}
+
+// The model directory the adapters belong to. The UI passes the same path it
+// loads the model from, so the store follows the model rather than the server.
+HttpResponse ServerState::handle_lora_list(const HttpRequest & request) const {
+    if (!config_.ui_enabled && !config_.ui_management) {
+        return error_response(403, "the UI is disabled", "forbidden");
+    }
+    const auto model = decoded_query_param(request.query, "model");
+    if (model.empty()) {
+        return error_response(400, "model path is required", "invalid_request_error");
+    }
+    const auto directory = resolve_adapter_directory(model);
+    if (!directory.has_value()) {
+        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+    }
+    std::string items;
+    for (const auto & info : minitts::server::list_stored_adapters(directory->parent_path())) {
+        if (!items.empty()) items += ",";
+        items += adapter_json(info);
+    }
+    return json_response("{\"directory\":" + json_quote(directory->string()) +
+        ",\"adapters\":[" + items + "]}");
+}
+
+HttpResponse ServerState::handle_lora_upload(const HttpRequest & request) {
+    if (!config_.ui_management) {
+        return error_response(403, "UI model management is disabled", "forbidden");
+    }
+    if (request.body.empty()) {
+        return error_response(400, "upload body is empty", "invalid_request_error");
+    }
+    std::string model;
+    if (const auto it = request.headers.find("x-audiocpp-model"); it != request.headers.end()) {
+        model = it->second;
+    }
+    if (model.empty()) {
+        return error_response(400, "x-audiocpp-model header is required", "invalid_request_error");
+    }
+    std::string filename = "adapter.safetensors";
+    if (const auto it = request.headers.find("x-audiocpp-filename"); it != request.headers.end()) {
+        filename = safe_upload_name(it->second);
+    }
+    if (filename.size() < 12 || filename.substr(filename.size() - 12) != ".safetensors") {
+        return error_response(400, "adapters must be .safetensors files", "invalid_request_error");
+    }
+    const auto resolved = resolve_adapter_directory(model);
+    if (!resolved.has_value()) {
+        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+    }
+    const auto & directory = *resolved;
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    const auto destination = directory / filename;
+    if (std::filesystem::exists(destination, ec)) {
+        return error_response(409, "already stored: " + filename, "invalid_request_error");
+    }
+    // Staged, then classified, then published -- an adapter that cannot load is
+    // never left in the store for the picker to offer.
+    const auto staging = destination.string() + ".partial";
+    {
+        std::ofstream out(staging, std::ios::binary);
+        if (!out) return error_response(500, "could not write into " + directory.string(), "server_error");
+        out.write(request.body.data(), static_cast<std::streamsize>(request.body.size()));
+        if (!out) return error_response(500, "could not write " + filename, "server_error");
+    }
+    auto header = minitts::server::read_local_safetensors_header(staging);
+    if (!header.has_value()) {
+        std::filesystem::remove(staging, ec);
+        return error_response(400, filename + " is not a safetensors file", "invalid_request_error");
+    }
+    auto info = minitts::server::classify_safetensors_header(*header);
+    if (!info.loadable) {
+        std::filesystem::remove(staging, ec);
+        return error_response(400, "rejected " + filename + ": " +
+            (info.note.empty() ? "not an unfused adapter" : info.note), "invalid_request_error");
+    }
+    std::filesystem::rename(staging, destination, ec);
+    if (ec) return error_response(500, "could not store " + filename, "server_error");
+    info.file = filename;
+    info.relative_path = "loras/" + filename;
+    info.bytes = static_cast<uint64_t>(request.body.size());
+    return json_response(adapter_json(info));
+}
+
+HttpResponse ServerState::handle_lora_delete(const std::string & body_text) {
+    if (!config_.ui_management) {
+        return error_response(403, "UI model management is disabled", "forbidden");
+    }
+    const auto body = engine::io::json::parse(body_text);
+    const auto model = engine::io::json::require_string(body, "model");
+    const auto file = engine::io::json::require_string(body, "file");
+    const auto resolved = resolve_adapter_directory(model);
+    if (!resolved.has_value()) {
+        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+    }
+    // Only ever a basename inside the store, so a crafted "file" cannot escape it.
+    const auto target = *resolved / std::filesystem::u8path(file).filename();
+    std::error_code ec;
+    if (!std::filesystem::exists(target, ec)) {
+        return error_response(404, "no stored adapter named " + target.filename().string(), "invalid_request_error");
+    }
+    std::filesystem::remove(target, ec);
+    if (ec) return error_response(500, "could not delete " + target.filename().string(), "server_error");
+    return json_response("{\"deleted\":" + json_quote(target.filename().string()) + "}");
+}
+
+HttpResponse ServerState::handle_lora_browse(const std::string & body_text) const {
+    if (!config_.ui_management) {
+        return error_response(403, "UI model management is disabled", "forbidden");
+    }
+    const auto body = engine::io::json::parse(body_text);
+    const auto repo = engine::io::json::require_string(body, "repo");
+    const auto revision = engine::io::json::optional_string(body, "revision", "");
+    std::string items;
+    try {
+        for (const auto & remote : minitts::server::browse_remote_adapters(repo, revision)) {
+            if (!items.empty()) items += ",";
+            auto entry = adapter_json(remote.info);
+            entry.pop_back();
+            entry += ",\"repo_file\":" + json_quote(remote.file) + "}";
+            items += entry;
+        }
+    } catch (const std::exception & error) {
+        return error_response(400, error.what(), "invalid_request_error");
+    }
+    return json_response("{\"repo\":" + json_quote(repo) + ",\"adapters\":[" + items + "]}");
+}
+
+HttpResponse ServerState::handle_lora_download(const std::string & body_text) {
+    if (!config_.ui_management) {
+        return error_response(403, "UI model management is disabled", "forbidden");
+    }
+    const auto body = engine::io::json::parse(body_text);
+    const auto repo = engine::io::json::require_string(body, "repo");
+    const auto file = engine::io::json::require_string(body, "file");
+    const auto model = engine::io::json::require_string(body, "model");
+    const auto revision = engine::io::json::optional_string(body, "revision", "");
+    const auto resolved = resolve_adapter_directory(model);
+    if (!resolved.has_value()) {
+        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+    }
+    std::filesystem::path stored;
+    try {
+        stored = minitts::server::download_remote_adapter(repo, revision, file, resolved->parent_path());
+    } catch (const std::exception & error) {
+        return error_response(400, error.what(), "invalid_request_error");
+    }
+    auto header = minitts::server::read_local_safetensors_header(stored);
+    auto info = header.has_value() ? minitts::server::classify_safetensors_header(*header)
+                                   : minitts::server::AdapterInfo{};
+    info.file = stored.filename().string();
+    info.relative_path = "loras/" + info.file;
+    std::error_code ec;
+    info.bytes = static_cast<uint64_t>(std::filesystem::file_size(stored, ec));
+    return json_response(adapter_json(info));
+}
+#endif
 
 #if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
 HttpResponse ServerState::handle_model_install(const std::string & body_text) {

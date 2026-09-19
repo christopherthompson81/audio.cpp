@@ -2523,8 +2523,10 @@ if(AUDIOCPP_STATIC_ESPEAK)
 endif()
 audiocpp_configure_server_frontends(audiocpp_server)
 if (AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER)
-    target_sources(audiocpp_server PRIVATE app/server/model_installer.cpp)
-    target_link_libraries(audiocpp_server PRIVATE audiocpp_package_manager)
+    # The adapter store fetches from Hugging Face, so it shares the manager's
+    # opt-in HTTP/TLS dependency rather than adding one to plain server builds.
+    target_sources(audiocpp_server PRIVATE app/server/model_installer.cpp app/server/lora_store.cpp)
+    target_link_libraries(audiocpp_server PRIVATE audiocpp_package_manager audiocpp_cpp_httplib)
     target_compile_definitions(audiocpp_server PRIVATE AUDIOCPP_HAS_NATIVE_MODEL_MANAGER=1)
 endif()
 target_include_directories(audiocpp_server PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
