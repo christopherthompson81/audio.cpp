@@ -89,7 +89,15 @@ std::string directory_gguf_hint(std::string_view family) {
         return {};
     }
     if (files.size() > 1) {
-        return ambiguous_directory_gguf_message(*active_model_path, files);
+        // Reached only when no model spec was found at all. Several GGUFs in a
+        // directory is a legitimate multi-component layout, so say what actually
+        // failed -- blaming the GGUF count here sends readers hunting for an
+        // ambiguity that is not the problem.
+        return "no model spec for family '" + std::string(family) + "' and none of the " +
+               std::to_string(files.size()) + " GGUFs in " + active_model_path->string() +
+               " embeds one (" + gguf_file_list(files) +
+               "); install model_specs/" + std::string(family) +
+               ".json, or pass --model-spec-override";
     }
     return "GGUF has no embedded model spec for family '" + std::string(family) + "': " +
            files.front().string() + "; install model_specs/" + std::string(family) +
@@ -231,6 +239,28 @@ std::filesystem::path resolve_model_root(const std::filesystem::path & model_pat
 
 std::string require_source_format(const engine::io::json::Value & source) {
     return engine::io::json::require_string(source, "format");
+}
+
+// True when a source reads "the" GGUF of a package, i.e. it declares a "$gguf"
+// root. Those sources need the directory to narrow down to exactly one file.
+//
+// A family whose GGUF source declares no "$gguf" root names its component files
+// itself -- either in the spec (liveavatar points each tensor group at a named
+// GGUF) or at load time from session options (yue2 uses yue2.model_gguf and
+// yue2.vae_gguf). For those, several GGUFs in one directory is the normal
+// installed layout, not an ambiguity.
+bool source_requires_standalone_gguf(const engine::io::json::Value & source) {
+    const auto * roots = source.find("roots");
+    if (roots == nullptr || !roots->is_object()) {
+        return false;
+    }
+    for (const auto & [id, value] : roots->as_object()) {
+        (void) id;
+        if (value.is_string() && value.as_string() == "$gguf") {
+            return true;
+        }
+    }
+    return false;
 }
 
 using ResourceRoots = std::unordered_map<std::string, std::filesystem::path>;
@@ -427,12 +457,26 @@ SelectedSource require_selected_source(const std::filesystem::path & model_path,
     }
     const auto & sources = spec.require("sources").as_array();
     const bool explicit_gguf_path = is_gguf_file(model_path);
-    const bool use_gguf = explicit_gguf_path || assets::find_directory_gguf(model_path).has_value();
+    bool use_gguf = explicit_gguf_path || assets::find_directory_gguf(model_path).has_value();
     if (!use_gguf) {
-        // A directory whose GGUFs cannot be narrowed down to one would otherwise fall through to
-        // the safetensors source and fail much later on a config file the GGUF package never ships.
         if (const auto files = assets::directory_gguf_files(model_path); files.size() > 1) {
-            throw std::runtime_error(ambiguous_directory_gguf_message(model_path, files));
+            // Several GGUFs and no model.gguf. That is ambiguous only for a source
+            // that reads "the" GGUF; a multi-component family names its own files,
+            // so this is its normal installed layout. YuE2 ships a main and a VAE
+            // GGUF side by side and picks between them with yue2.model_gguf and
+            // yue2.vae_gguf -- rejecting that made the family unloadable from any
+            // caller that passes the package directory.
+            const bool multi_component_gguf = std::any_of(sources.begin(), sources.end(),
+                [](const engine::io::json::Value & source) {
+                    return require_source_format(source) == "gguf" &&
+                           !source_requires_standalone_gguf(source);
+                });
+            if (!multi_component_gguf) {
+                // Otherwise this would fall through to the safetensors source and fail
+                // much later on a config file the GGUF package never ships.
+                throw std::runtime_error(ambiguous_directory_gguf_message(model_path, files));
+            }
+            use_gguf = true;
         }
     }
     for (const auto & source : sources) {
