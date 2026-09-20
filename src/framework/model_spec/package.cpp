@@ -89,14 +89,16 @@ std::string directory_gguf_hint(std::string_view family) {
         return {};
     }
     if (files.size() > 1) {
-        // Reached only when no model spec was found at all. Several GGUFs in a
-        // directory is a legitimate multi-component layout, so say what actually
-        // failed -- blaming the GGUF count here sends readers hunting for an
-        // ambiguity that is not the problem.
-        return "no model spec for family '" + std::string(family) + "' and none of the " +
-               std::to_string(files.size()) + " GGUFs in " + active_model_path->string() +
-               " embeds one (" + gguf_file_list(files) +
-               "); install model_specs/" + std::string(family) +
+        // Reached only when no model spec was found at all. Name the missing spec
+        // as the failure -- on its own, several GGUFs in a directory is a valid
+        // multi-component layout -- but keep the candidate list and the "pass one
+        // directly" remedy, because being unable to choose between them is exactly
+        // why no embedded spec could be read.
+        return "no model spec for family '" + std::string(family) +
+               "': the model directory contains " + std::to_string(files.size()) + " GGUF files: " +
+               active_model_path->string() + "; found: " + gguf_file_list(files) +
+               "; none embeds a spec for this family and none can be chosen automatically. Pass one "
+               "of them directly with --model, install model_specs/" + std::string(family) +
                ".json, or pass --model-spec-override";
     }
     return "GGUF has no embedded model spec for family '" + std::string(family) + "': " +
