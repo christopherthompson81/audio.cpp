@@ -1487,11 +1487,11 @@ namespace {
 
 std::string adapter_json(const minitts::server::AdapterInfo & info) {
     std::string out = "{\"file\":" + json_quote(info.file) +
+        ",\"group\":" + json_quote(info.group) +
         ",\"path\":" + json_quote(info.relative_path) +
         ",\"bytes\":" + std::to_string(info.bytes) +
-        ",\"branch\":" + json_quote(info.branch) +
         ",\"layout\":" + json_quote(info.layout) +
-        ",\"loadable\":" + std::string(info.loadable ? "true" : "false");
+        ",\"unfused_lora\":" + std::string(info.unfused_lora ? "true" : "false");
     if (!info.rank.empty()) out += ",\"rank\":" + json_quote(info.rank);
     if (!info.base_model.empty()) out += ",\"base_model\":" + json_quote(info.base_model);
     if (!info.note.empty()) out += ",\"note\":" + json_quote(info.note);
@@ -1509,13 +1509,27 @@ std::string adapter_json(const minitts::server::AdapterInfo & info) {
 // the browser chooses. Without this check a request could write a multi-gigabyte
 // file, or delete one, anywhere the server process can, and ui_management has no
 // authentication of its own.
+//
+// The comparison is on resolved paths, not lexical ones. A lexical prefix check
+// reads "<root>/link/loras" as inside the root however `link` is defined, so a
+// symlink anywhere under the root -- one the operator made for their own
+// convenience, or one left by an earlier request -- hands the caller the target
+// directory instead. weakly_canonical() follows the links and tolerates the
+// last component not existing yet, which is the normal case for a store that
+// has not been written to.
 std::optional<std::filesystem::path> ServerState::resolve_adapter_directory(
-    const std::string & model) const {
+    const std::string & model, const std::string & group) const {
     if (model.empty()) return std::nullopt;
+    // A group that does not survive sanitising is a caller error, not something
+    // to quietly file at the root.
+    if (!group.empty() && minitts::server::sanitize_group(group) != group) return std::nullopt;
     const auto resolved = resolve_ui_model_path(std::filesystem::u8path(model));
-    const auto directory = minitts::server::adapter_directory(resolved).lexically_normal();
-    const auto root = models_root_.lexically_normal();
-    if (root.empty()) return std::nullopt;
+    std::error_code ec;
+    const auto directory = std::filesystem::weakly_canonical(
+        minitts::server::adapter_directory(resolved, group), ec);
+    if (ec) return std::nullopt;
+    const auto root = std::filesystem::weakly_canonical(models_root_, ec);
+    if (ec || root.empty()) return std::nullopt;
     auto candidate = directory.begin();
     for (auto part = root.begin(); part != root.end(); ++part, ++candidate) {
         if (candidate == directory.end() || *candidate != *part) return std::nullopt;
@@ -1567,20 +1581,33 @@ HttpResponse ServerState::handle_lora_upload(const HttpRequest & request) {
     if (filename.size() < 12 || filename.substr(filename.size() - 12) != ".safetensors") {
         return error_response(400, "adapters must be .safetensors files", "invalid_request_error");
     }
-    const auto resolved = resolve_adapter_directory(model);
+    // The caller says which folder this belongs in; the store does not guess.
+    std::string group;
+    if (const auto it = request.headers.find("x-audiocpp-group"); it != request.headers.end()) {
+        group = it->second;
+    }
+    const auto resolved = resolve_adapter_directory(model, group);
     if (!resolved.has_value()) {
-        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+        return error_response(400, "model path or group is not usable here", "invalid_request_error");
     }
     const auto & directory = *resolved;
     std::error_code ec;
     std::filesystem::create_directories(directory, ec);
     const auto destination = directory / filename;
-    if (std::filesystem::exists(destination, ec)) {
-        return error_response(409, "already stored: " + filename, "invalid_request_error");
-    }
     // Staged, then classified, then published -- an adapter that cannot load is
     // never left in the store for the picker to offer.
     const auto staging = destination.string() + ".partial";
+    // symlink_status() rather than exists(): exists() follows the link, so a
+    // symlink pointing at something that is not there yet reads as free and the
+    // write lands on its target. Refuse anything already at either name.
+    const auto occupied = [](const std::filesystem::path & path) {
+        std::error_code status_ec;
+        const auto status = std::filesystem::symlink_status(path, status_ec);
+        return !status_ec && status.type() != std::filesystem::file_type::not_found;
+    };
+    if (occupied(destination) || occupied(staging)) {
+        return error_response(409, "already stored: " + filename, "invalid_request_error");
+    }
     {
         std::ofstream out(staging, std::ios::binary);
         if (!out) return error_response(500, "could not write into " + directory.string(), "server_error");
@@ -1593,7 +1620,7 @@ HttpResponse ServerState::handle_lora_upload(const HttpRequest & request) {
         return error_response(400, filename + " is not a safetensors file", "invalid_request_error");
     }
     auto info = minitts::server::classify_safetensors_header(*header);
-    if (!info.loadable) {
+    if (!info.unfused_lora) {
         std::filesystem::remove(staging, ec);
         return error_response(400, "rejected " + filename + ": " +
             (info.note.empty() ? "not an unfused adapter" : info.note), "invalid_request_error");
@@ -1601,7 +1628,8 @@ HttpResponse ServerState::handle_lora_upload(const HttpRequest & request) {
     std::filesystem::rename(staging, destination, ec);
     if (ec) return error_response(500, "could not store " + filename, "server_error");
     info.file = filename;
-    info.relative_path = "loras/" + filename;
+    info.group = group;
+    info.relative_path = group.empty() ? "loras/" + filename : "loras/" + group + "/" + filename;
     info.bytes = static_cast<uint64_t>(request.body.size());
     return json_response(adapter_json(info));
 }
@@ -1613,9 +1641,10 @@ HttpResponse ServerState::handle_lora_delete(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     const auto model = engine::io::json::require_string(body, "model");
     const auto file = engine::io::json::require_string(body, "file");
-    const auto resolved = resolve_adapter_directory(model);
+    const auto group = engine::io::json::optional_string(body, "group", "");
+    const auto resolved = resolve_adapter_directory(model, group);
     if (!resolved.has_value()) {
-        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+        return error_response(400, "model path or group is not usable here", "invalid_request_error");
     }
     // Only ever a basename inside the store, so a crafted "file" cannot escape it.
     const auto target = *resolved / std::filesystem::u8path(file).filename();
@@ -1659,13 +1688,18 @@ HttpResponse ServerState::handle_lora_download(const std::string & body_text) {
     const auto file = engine::io::json::require_string(body, "file");
     const auto model = engine::io::json::require_string(body, "model");
     const auto revision = engine::io::json::optional_string(body, "revision", "");
-    const auto resolved = resolve_adapter_directory(model);
+    const auto group = engine::io::json::optional_string(body, "group", "");
+    // Validates the model path and the group; the store is handed the model
+    // directory and files the download under the group itself.
+    const auto resolved = resolve_adapter_directory(model, group);
     if (!resolved.has_value()) {
-        return error_response(400, "model path is outside the models folder", "invalid_request_error");
+        return error_response(400, "model path or group is not usable here", "invalid_request_error");
     }
+    const auto model_directory = group.empty() ? resolved->parent_path()
+                                               : resolved->parent_path().parent_path();
     std::filesystem::path stored;
     try {
-        stored = minitts::server::download_remote_adapter(repo, revision, file, resolved->parent_path());
+        stored = minitts::server::download_remote_adapter(repo, revision, file, model_directory, group);
     } catch (const std::exception & error) {
         return error_response(400, error.what(), "invalid_request_error");
     }
@@ -1673,7 +1707,9 @@ HttpResponse ServerState::handle_lora_download(const std::string & body_text) {
     auto info = header.has_value() ? minitts::server::classify_safetensors_header(*header)
                                    : minitts::server::AdapterInfo{};
     info.file = stored.filename().string();
-    info.relative_path = "loras/" + info.file;
+    info.group = group;
+    info.relative_path = group.empty() ? "loras/" + info.file
+                                       : "loras/" + group + "/" + info.file;
     std::error_code ec;
     info.bytes = static_cast<uint64_t>(std::filesystem::file_size(stored, ec));
     return json_response(adapter_json(info));

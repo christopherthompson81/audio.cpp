@@ -67,20 +67,14 @@ AdapterInfo classify_safetensors_header(const std::string & header_json) {
     const auto root = engine::io::json::parse(header_json);
     bool has_lora_ab = false;    // lora_A / lora_B -- what this engine merges
     bool has_comfy = false;      // diffusion_model.* or lora_up / lora_down
-    bool saw_ar = false;
-    bool saw_nar = false;
-    std::string declared_branch;
     size_t tensors = 0;
 
     if (!root.is_object()) throw std::runtime_error("safetensors header is not a JSON object");
     for (const auto & [name, value] : root.as_object()) {
         if (name == "__metadata__") {
+            // Both keys are PEFT conventions rather than any one family's.
             info.rank = engine::io::json::optional_string(value, "rank", "");
-            if (info.rank.empty()) {
-                info.rank = engine::io::json::optional_string(value, "lora_rank_separate", "");
-            }
             info.base_model = engine::io::json::optional_string(value, "base_model", "");
-            declared_branch = engine::io::json::optional_string(value, "yue2_lora_branch", "");
             continue;
         }
         ++tensors;
@@ -89,36 +83,24 @@ AdapterInfo classify_safetensors_header(const std::string & header_json) {
             name.find(".lora_down") != std::string::npos) has_comfy = true;
         if (name.find(".lora_A") != std::string::npos ||
             name.find(".lora_B") != std::string::npos) has_lora_ab = true;
-        // The engine keys on these exact names (see models/yue2/lora.cpp), so the
-        // branch is read the same way the loader reads it.
-        if (name.find(".nar_self_attn.") != std::string::npos ||
-            name.find(".nar_mlp.") != std::string::npos) saw_nar = true;
-        else if (name.find(".self_attn.") != std::string::npos ||
-                 name.find(".mlp.") != std::string::npos) saw_ar = true;
     }
 
+    // Note what the file *is*, not what it suits. lora_A/lora_B is the shape
+    // every LoRA-consuming family here reads, and a ComfyUI fused layout is one
+    // none of them can read; which model an unfused adapter was trained against
+    // is a question for the loader, which has the tensor layout to answer it.
     if (has_comfy) {
         info.layout = "comfyui";
-        info.loadable = false;
+        info.unfused_lora = false;
         info.note = "ComfyUI fused layout; this engine needs the unfused file";
     } else if (has_lora_ab) {
         info.layout = "unfused";
-        info.loadable = true;
+        info.unfused_lora = true;
     } else {
         info.layout = "not-an-adapter";
-        info.loadable = false;
+        info.unfused_lora = false;
         info.note = tensors == 0 ? "no tensors" : "no LoRA A/B pairs; a different component";
     }
-
-    // ComfyUI stores the NAR branch under generic self_attn/mlp names below
-    // diffusion_model.*, so tensor names cannot tell the branches apart there;
-    // the author's own metadata can. Tensor names stay authoritative elsewhere.
-    if (!declared_branch.empty()) info.branch = declared_branch;
-    else if (has_comfy || !has_lora_ab) info.branch = "unknown";
-    else if (saw_nar && saw_ar) info.branch = "both";
-    else if (saw_nar) info.branch = "nar";
-    else if (saw_ar) info.branch = "ar";
-    else info.branch = "unknown";
     return info;
 }
 
@@ -182,18 +164,35 @@ httplib::Client probe_client() {
 }
 }  // namespace
 
-std::filesystem::path adapter_directory(const std::filesystem::path & model_directory) {
+std::string sanitize_group(const std::string & group) {
+    // One component, and only characters that cannot mean anything else to a
+    // path: no separators, no "..", nothing hidden.
+    auto name = std::filesystem::path(group).filename().string();
+    std::string cleaned;
+    for (const char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') cleaned += c;
+    }
+    return cleaned;
+}
+
+std::filesystem::path adapter_directory(const std::filesystem::path & model_directory,
+                                        const std::string & group) {
     auto directory = model_directory;
     std::error_code ec;
     if (std::filesystem::is_regular_file(directory, ec)) directory = directory.parent_path();
-    return directory / "loras";
+    directory /= "loras";
+    const auto cleaned = sanitize_group(group);
+    if (!cleaned.empty()) directory /= cleaned;
+    return directory;
 }
 
-std::vector<AdapterInfo> list_stored_adapters(const std::filesystem::path & model_directory) {
-    std::vector<AdapterInfo> found;
-    const auto directory = adapter_directory(model_directory);
+namespace {
+
+// One directory's worth of adapters, filed under `group` ("" for the flat root).
+void collect_adapters(const std::filesystem::path & directory, const std::string & group,
+                      std::vector<AdapterInfo> & found) {
     std::error_code ec;
-    if (!std::filesystem::is_directory(directory, ec)) return found;
+    if (!std::filesystem::is_directory(directory, ec)) return;
     for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
         if (!it->is_regular_file(ec)) continue;
         const auto path = it->path();
@@ -205,12 +204,38 @@ std::vector<AdapterInfo> list_stored_adapters(const std::filesystem::path & mode
             info.note = "could not read a safetensors header";
         }
         info.file = path.filename().string();
-        info.relative_path = "loras/" + info.file;
+        info.group = group;
+        info.relative_path = group.empty() ? "loras/" + info.file
+                                           : "loras/" + group + "/" + info.file;
         info.bytes = static_cast<uint64_t>(std::filesystem::file_size(path, ec));
         found.push_back(std::move(info));
     }
-    std::sort(found.begin(), found.end(),
-              [](const AdapterInfo & a, const AdapterInfo & b) { return a.file < b.file; });
+}
+
+}  // namespace
+
+std::vector<AdapterInfo> list_stored_adapters(const std::filesystem::path & model_directory) {
+    std::vector<AdapterInfo> found;
+    const auto root = adapter_directory(model_directory);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) return found;
+
+    // The flat root stays readable so a file dropped in by hand still appears;
+    // it simply has no group and the UI offers it everywhere.
+    collect_adapters(root, "", found);
+
+    // One level down, and no deeper: the folder name is the group. Symlinked
+    // subdirectories are skipped -- the store is for files it was given.
+    for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_symlink(ec) || !it->is_directory(ec)) continue;
+        const auto name = it->path().filename().string();
+        if (sanitize_group(name) != name) continue;
+        collect_adapters(it->path(), name, found);
+    }
+
+    std::sort(found.begin(), found.end(), [](const AdapterInfo & a, const AdapterInfo & b) {
+        return a.group == b.group ? a.file < b.file : a.group < b.group;
+    });
     return found;
 }
 
@@ -286,12 +311,12 @@ std::vector<RemoteAdapter> browse_remote_adapters(const std::string & repo, cons
 
 std::filesystem::path download_remote_adapter(
     const std::string & repo, const std::string & revision, const std::string & file,
-    const std::filesystem::path & model_directory) {
+    const std::filesystem::path & model_directory, const std::string & group) {
     static const std::regex kRepo(R"(^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$)");
     if (!std::regex_match(repo, kRepo)) {
         throw std::runtime_error("expected a short \"owner/model\" repo id, got: " + repo);
     }
-    const auto directory = adapter_directory(model_directory);
+    const auto directory = adapter_directory(model_directory, group);
     std::error_code ec;
     std::filesystem::create_directories(directory, ec);
     const auto destination = directory / safe_basename(file);
@@ -319,10 +344,11 @@ std::filesystem::path download_remote_adapter(
         throw std::runtime_error("download failed for " + file +
             (response ? " (HTTP " + std::to_string(response->status) + ")" : ""));
     }
-    // Verify before publishing: a file that will not load is worse than no file.
+    // Verify before publishing: a file no family here can read is worse than no
+    // file. Whether it matches the model it was fetched for is the loader's call.
     if (auto header = read_local_safetensors_header(staging); header.has_value()) {
         const auto info = classify_safetensors_header(*header);
-        if (!info.loadable) {
+        if (!info.unfused_lora) {
             std::filesystem::remove(staging, ec);
             throw std::runtime_error("rejected " + file + ": " +
                 (info.note.empty() ? "not an unfused adapter" : info.note));

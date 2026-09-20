@@ -115,7 +115,8 @@ private:
 #if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
     // Persistent per-model LoRA adapter store; see lora_store.h. The resolver
     // confines every adapter path to the models root.
-    std::optional<std::filesystem::path> resolve_adapter_directory(const std::string & model) const;
+    std::optional<std::filesystem::path> resolve_adapter_directory(
+        const std::string & model, const std::string & group = "") const;
 
     HttpResponse handle_lora_list(const HttpRequest & request) const;
     HttpResponse handle_lora_upload(const HttpRequest & request);

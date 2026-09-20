@@ -56,17 +56,20 @@
 
   // Adapters stored in <model>/loras/. These persist across restarts, unlike the
   // temporary /v1/ui/upload path the old free-text field relied on.
+  // `group` is the folder an adapter is filed under, decided when it is stored
+  // rather than guessed from its tensor names afterwards. The server treats it
+  // as an opaque name, so which slot a file belongs to is recorded, not derived.
   type LoraSlot = {
     name: 'ar_lora' | 'nar_lora';
     scale: 'ar_lora_scale' | 'nar_lora_scale';
-    branch: 'ar' | 'nar';
+    group: 'ar' | 'nar';
     title: string;
     blurb: string;
   };
   const loraSlots: LoraSlot[] = [
-    { name: 'ar_lora', scale: 'ar_lora_scale', branch: 'ar', title: 'AR LoRA',
+    { name: 'ar_lora', scale: 'ar_lora_scale', group: 'ar', title: 'AR LoRA',
       blurb: 'Changes what gets composed \u2014 melody, structure, arrangement.' },
-    { name: 'nar_lora', scale: 'nar_lora_scale', branch: 'nar', title: 'NAR LoRA',
+    { name: 'nar_lora', scale: 'nar_lora_scale', group: 'nar', title: 'NAR LoRA',
       blurb: 'Changes how it is rendered \u2014 the sound, not the notes.' }
   ];
   // Svelte cannot bind:this to a ternary, so the two file inputs are keyed.
@@ -83,8 +86,8 @@
   let browseRequest: AbortController | null = null;
   onDestroy(() => { loraUpload?.abort(); narLoraUpload?.abort(); browseRequest?.abort(); });
 
-  $: adaptersFor = (branch: 'ar' | 'nar') =>
-    stored.filter((a) => a.loadable && (a.branch === branch || a.branch === 'both' || a.branch === 'unknown'));
+  $: adaptersFor = (group: 'ar' | 'nar') =>
+    stored.filter((a) => a.unfused_lora && (a.group === group || a.group === ''));
 
   function megabytes(bytes: number) {
     return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(2)} GB` : `${Math.round(bytes / 1e6)} MB`;
@@ -120,10 +123,10 @@
     try {
       const result = await browseAdapterRepo(repo, browseRequest.signal);
       repoAdapters = result.adapters;
-      const usable = repoAdapters.filter((a) => a.loadable).length;
+      const usable = repoAdapters.filter((a) => a.unfused_lora).length;
       repoNotice = usable
-        ? `${usable} of ${repoAdapters.length} files in ${repo} can be loaded here.`
-        : `None of the ${repoAdapters.length} safetensors in ${repo} are unfused adapters this engine can load.`;
+        ? `${usable} of ${repoAdapters.length} files in ${repo} are unfused adapters. Whether one fits YuE2 shows when the model loads it.`
+        : `None of the ${repoAdapters.length} safetensors in ${repo} are unfused adapters this engine can read.`;
     } catch (error) {
       if (!browseRequest.signal.aborted) repoError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -131,17 +134,16 @@
     }
   }
 
-  async function fetchAdapter(adapter: StoredAdapter) {
+  async function fetchAdapter(adapter: StoredAdapter, slot: LoraSlot) {
     const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
     if (!entry || !adapter.repo_file) return;
     repoError = '';
     downloading = adapter.repo_file;
     try {
-      const saved = await downloadAdapter(repoId.trim(), adapter.repo_file, modelPathFor(entry));
+      const saved = await downloadAdapter(repoId.trim(), adapter.repo_file, modelPathFor(entry), slot.group);
       await refreshStored();
-      // Select what was just fetched, into whichever field it belongs to.
-      setNamedParameter(saved.branch === 'ar' ? 'ar_lora' : 'nar_lora', saved.path);
-      repoNotice = `Stored ${saved.file}. Reload the model to apply it.`;
+      setNamedParameter(slot.name, saved.path);
+      repoNotice = `Stored ${saved.file} as a ${slot.group.toUpperCase()} adapter. Reload the model to apply it.`;
     } catch (error) {
       repoError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -149,12 +151,16 @@
     }
   }
 
-  async function removeAdapter(file: string, name: 'ar_lora' | 'nar_lora') {
+  async function removeAdapter(path: string, name: 'ar_lora' | 'nar_lora') {
     const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
     if (!entry) return;
+    // path is "loras/<file>" or "loras/<group>/<file>"; the server wants them apart.
+    const parts = path.split('/');
+    const file = parts[parts.length - 1];
+    const group = parts.length > 2 ? parts[1] : '';
     try {
-      await deleteAdapter(modelPathFor(entry), file);
-      if (String(advancedValues[name] ?? '') === `loras/${file}`) setNamedParameter(name, '');
+      await deleteAdapter(modelPathFor(entry), file, group);
+      if (String(advancedValues[name] ?? '') === path) setNamedParameter(name, '');
       await refreshStored();
     } catch (error) {
       storeError = error instanceof Error ? error.message : String(error);
@@ -180,7 +186,8 @@
     try {
       const entry = catalogEntries.find((candidate) => candidate.family === 'yue2');
       if (!entry) throw new Error('no YuE2 model in the catalog to store the adapter beside');
-      const saved = await uploadAdapter(file, modelPathFor(entry), upload.signal);
+      const slot = loraSlots.find((candidate) => candidate.name === name);
+      const saved = await uploadAdapter(file, modelPathFor(entry), slot?.group ?? '', upload.signal);
       await refreshStored();
       setNamedParameter(name, saved.path);
       log(`YuE2 ${isNar ? 'NAR' : 'AR'} LoRA stored: ${saved.file}`);
@@ -425,7 +432,7 @@
               value={String(advancedValues[slot.name] ?? '')}
               on:change={(event) => setNamedParameter(slot.name, event.currentTarget.value)}>
               <option value="">None</option>
-              {#each adaptersFor(slot.branch) as adapter}
+              {#each adaptersFor(slot.group) as adapter}
                 <option value={adapter.path}>{adapterOptionLabel(adapter)}</option>
               {/each}
               {#if advancedValues[slot.name] && !stored.some((a) => a.path === advancedValues[slot.name])}
@@ -446,7 +453,7 @@
                 on:click={() => setNamedParameter(slot.name, '')}>Clear</button>
               {#if String(advancedValues[slot.name] ?? '').startsWith('loras/')}
                 <button type="button" disabled={!server?.ui_management || busy}
-                  on:click={() => removeAdapter(String(advancedValues[slot.name]).slice(6), slot.name)}>Delete stored</button>
+                  on:click={() => removeAdapter(String(advancedValues[slot.name]), slot.name)}>Delete stored</button>
               {/if}
             </div>
             {#if slot.name === 'ar_lora' && loraError}<span class="yue2-error" role="alert">{loraError}</span>{/if}
@@ -483,24 +490,28 @@
           <button type="button" disabled={!server?.ui_management || repoBusy || !repoId.trim()}
             on:click={browseRepo}>{repoBusy ? 'Reading...' : 'List adapters'}</button>
         </div>
-        <small>Each file is identified by reading its header, so nothing large is downloaded to find out what it is. Only adapters this engine can load are offered.</small>
+        <small>Each file is identified by reading its header, so nothing large is downloaded to find out what it is. Only unfused adapters are offered; pick the slot it is for, and whether it suits YuE2 shows when the model loads it.</small>
         {#if repoError}<span class="yue2-error" role="alert">{repoError}</span>{/if}
         {#if repoNotice}<small>{repoNotice}</small>{/if}
       </div>
       {#if repoAdapters.length}
         <div class="yue2-field wide">
-          {#each repoAdapters.filter((a) => a.loadable) as adapter}
+          {#each repoAdapters.filter((a) => a.unfused_lora) as adapter}
             <div class="media-actions">
-              <button type="button"
-                disabled={!server?.ui_management || Boolean(downloading) || stored.some((a) => a.file === adapter.file)}
-                on:click={() => fetchAdapter(adapter)}>
-                {downloading === adapter.repo_file ? 'Downloading...'
-                  : stored.some((a) => a.file === adapter.file) ? 'Stored' : 'Download'}</button>
-              <span>{adapter.file} &middot; {adapter.branch.toUpperCase()} &middot; {megabytes(adapter.bytes)}{adapter.rank ? ` · rank ${adapter.rank}` : ''}</span>
+              {#each loraSlots as slot}
+                <button type="button"
+                  disabled={!server?.ui_management || Boolean(downloading)
+                    || stored.some((a) => a.file === adapter.file && a.group === slot.group)}
+                  on:click={() => fetchAdapter(adapter, slot)}>
+                  {downloading === adapter.repo_file ? 'Downloading...'
+                    : stored.some((a) => a.file === adapter.file && a.group === slot.group) ? `Stored as ${slot.group.toUpperCase()}`
+                    : `Download as ${slot.group.toUpperCase()}`}</button>
+              {/each}
+              <span>{adapter.file} &middot; {megabytes(adapter.bytes)}{adapter.rank ? ` · rank ${adapter.rank}` : ''}</span>
             </div>
           {/each}
-          {#if repoAdapters.some((a) => !a.loadable)}
-            <small>{repoAdapters.filter((a) => !a.loadable).length} other file(s) in this repo are not loadable here (ComfyUI layouts, or other components).</small>
+          {#if repoAdapters.some((a) => !a.unfused_lora)}
+            <small>{repoAdapters.filter((a) => !a.unfused_lora).length} other file(s) in this repo are not unfused adapters (ComfyUI layouts, or other components).</small>
           {/if}
         </div>
       {/if}

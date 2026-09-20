@@ -220,11 +220,11 @@ export async function runTask(body: Record<string, unknown>, signal?: AbortSigna
 
 export interface StoredAdapter {
   file: string;
+  group: string;         // the folder it is filed under; "" when at the root
   path: string;          // "loras/<file>", the value a session option takes
   bytes: number;
-  branch: string;        // "ar" | "nar" | "both" | "unknown"
   layout: string;        // "unfused" | "comfyui" | "not-an-adapter" | "unreadable"
-  loadable: boolean;
+  unfused_lora: boolean; // has lora_A/lora_B pairs; not a claim about this model
   rank?: string;
   base_model?: string;
   note?: string;
@@ -237,32 +237,38 @@ export async function listAdapters(model: string): Promise<{ directory: string; 
   return jsonRequest(`/v1/ui/loras?model=${encodeURIComponent(model)}`);
 }
 
-export async function uploadAdapter(file: File, model: string, signal?: AbortSignal): Promise<StoredAdapter> {
+// `group` is a folder name the caller picks -- the server files the adapter
+// there and reports it back, but attaches no meaning to it. The YuE2 panel uses
+// it to remember which slot an adapter was filed for.
+export async function uploadAdapter(file: File, model: string, group = '', signal?: AbortSignal): Promise<StoredAdapter> {
   return jsonRequest<StoredAdapter>('/v1/ui/loras/upload', {
     method: 'POST',
     headers: {
       'Content-Type': file.type || 'application/octet-stream',
       'X-AudioCPP-Filename': file.name,
-      'X-AudioCPP-Model': model
+      'X-AudioCPP-Model': model,
+      ...(group ? { 'X-AudioCPP-Group': group } : {})
     },
     body: file
   }, signal);
 }
 
-export async function deleteAdapter(model: string, file: string): Promise<void> {
-  await jsonRequest('/v1/ui/loras/delete', { method: 'POST', body: JSON.stringify({ model, file }) });
+export async function deleteAdapter(model: string, file: string, group = ''): Promise<void> {
+  await jsonRequest('/v1/ui/loras/delete', { method: 'POST', body: JSON.stringify({ model, file, group }) });
 }
 
-// Lists a Hugging Face repo's safetensors and classifies each from its header,
-// read with a ranged request so nothing large is downloaded to find out.
+// Lists a Hugging Face repo's safetensors and reports each one's shape from its
+// header, read with a ranged request so nothing large is downloaded to find out.
+// The server says whether a file is an unfused adapter, not whether it suits a
+// particular model -- only the loader has the tensor layout to answer that.
 export async function browseAdapterRepo(repo: string, signal?: AbortSignal): Promise<{ repo: string; adapters: StoredAdapter[] }> {
   return jsonRequest('/v1/ui/loras/browse', { method: 'POST', body: JSON.stringify({ repo }) }, signal);
 }
 
-export async function downloadAdapter(repo: string, file: string, model: string, signal?: AbortSignal): Promise<StoredAdapter> {
+export async function downloadAdapter(repo: string, file: string, model: string, group = '', signal?: AbortSignal): Promise<StoredAdapter> {
   return jsonRequest<StoredAdapter>('/v1/ui/loras/download', {
     method: 'POST',
-    body: JSON.stringify({ repo, file, model })
+    body: JSON.stringify({ repo, file, model, group })
   }, signal);
 }
 
