@@ -178,6 +178,10 @@ modules::QwenDecoderLayerConfig qwen_layer_config(const MossTtsDelayBackboneConf
     out.runtime.attention.prefill_mode = modules::QwenDecoderAttentionMode::ManualRepeat;
     out.runtime.attention.static_mode = modules::QwenDecoderAttentionMode::FlashGrouped;
     out.runtime.static_cache.update_mode = modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
+    // Required for the f16 cache below: the plain set-rows path writes f32 only,
+    // and the backend-view path is the one that accepts an f16/bf16 cache with
+    // an f32 row.
+    out.runtime.static_cache.set_rows_mode = modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
     return out;
 }
 
@@ -318,11 +322,17 @@ void MossTtsDelayBackboneRuntime::build_step_graph(int64_t cache_steps) const {
                  .build(ctx, token_input, weights.embed_tokens);
     x = modules::AddModule{}.build(ctx, x, bias_input);
     for (const auto & layer : weights.layers) {
+        // ⚠ F16, NOT F32. The cache is the only part of this model that grows
+        // with the length of a take, and at 8 KV heads x 128 head dim x 2 x 36
+        // layers it costs 288 KiB per step in f32. Keys and values are attention
+        // inputs, not accumulators: they are written once and read back, so the
+        // precision they are stored at is not compounded over steps. Same
+        // arrangement higgs_audio_tts uses for its decoder.
         auto cache_key = core::make_tensor(
-            ctx, GGML_TYPE_F32,
+            ctx, GGML_TYPE_F16,
             core::TensorShape::from_dims({1, cache_steps, config.num_key_value_heads, dim}));
         auto cache_value = core::make_tensor(
-            ctx, GGML_TYPE_F32,
+            ctx, GGML_TYPE_F16,
             core::TensorShape::from_dims({1, cache_steps, config.num_key_value_heads, dim}));
         cache_keys.push_back(cache_key);
         cache_values.push_back(cache_value);
@@ -360,11 +370,14 @@ void MossTtsDelayBackboneRuntime::build_step_graph(int64_t cache_steps) const {
     impl.step_cache_slot = cache_slot.tensor;
     impl.step_mask = attention_mask.tensor;
     impl.step_hidden = hidden.tensor;
+    runtime::TransformerKVCacheOptions cache_options;
+    cache_options.allow_f16_storage = true;
     impl.step_cache = runtime::TransformerKVCache(
         cache_steps,
         config.num_key_value_heads * config.head_dim,
         std::move(cache_keys),
-        std::move(cache_values));
+        std::move(cache_values),
+        cache_options);
     impl.mask_host.assign(static_cast<size_t>(cache_steps), ggml_fp32_to_fp16(kMaskedAttentionBias));
     impl.step_graph_build_ms += engine::debug::elapsed_ms(graph_build_start);
 }
@@ -379,21 +392,25 @@ void MossTtsDelayBackboneRuntime::begin_generation(int64_t max_positions) const 
         build_step_graph(max_positions);
     }
     // Zero the caches so not-yet-written (masked) rows can never inject NaNs into the softmax.
+    //
+    // ⚠ SIZED FROM THE TENSOR, NOT FROM sizeof(float). The cache is f16, so an
+    // f32-sized write is twice the tensor and ggml rejects it as out of bounds.
+    // A byte-wise zero fill is right for any of these types: all-zero bits is
+    // +0.0 in f32, f16 and bf16 alike.
     const auto & config = impl.config.backbone;
-    const size_t elems =
-        static_cast<size_t>(impl.step_cache.cache_steps() * config.num_key_value_heads * config.head_dim);
-    const std::vector<float> zeros(elems, 0.0F);
+    const size_t cache_bytes = ggml_nbytes(impl.step_cache.key_tensor(0).tensor);
+    const std::vector<std::byte> zeros(cache_bytes, std::byte{0});
     for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
         ggml_backend_tensor_set(
             impl.step_cache.key_tensor(static_cast<size_t>(layer)).tensor,
             zeros.data(),
             0,
-            elems * sizeof(float));
+            cache_bytes);
         ggml_backend_tensor_set(
             impl.step_cache.value_tensor(static_cast<size_t>(layer)).tensor,
             zeros.data(),
             0,
-            elems * sizeof(float));
+            cache_bytes);
     }
     impl.step_cache.retain_prefix(0);
 }
